@@ -3,8 +3,11 @@
 
 use core::panic::PanicInfo;
 
+use embassy_time::{Duration, with_timeout};
+use embedded_hal::spi::SpiBus;
 use esp_hal::Async;
 use esp_hal::clock::CpuClock;
+use esp_hal::interrupt::software::SoftwareInterruptControl;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
@@ -12,16 +15,17 @@ use esp_hal::usb_serial_jtag::{UsbSerialJtag, UsbSerialJtagRx};
 
 use embassy_executor::Spawner;
 use embedded_io_async::Read;
+use smart_leds::colors::BLACK;
 use smart_leds::{RGB8, SmartLedsWrite};
 use ws2812_spi::Ws2812;
+
+const NUM_LEDS: usize = 102;
+const RX_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[panic_handler]
 fn handle_panic(_: &PanicInfo) -> ! {
     esp_hal::system::software_reset()
 }
-
-const NUM_LEDS: usize = 102;
-const RAW_BUF_SIZE: usize = NUM_LEDS * 3;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -31,27 +35,28 @@ async fn main(_spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    let sw_interrupt =
-        esp_hal::interrupt::software::SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    let sw_interrupt = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
     esp_rtos::start(timg0.timer0, sw_interrupt.software_interrupt0);
 
     let spi_config = SpiConfig::default().with_frequency(Rate::from_mhz(3));
     let spi = Spi::new(peripherals.SPI2, spi_config)
         .unwrap()
         .with_mosi(peripherals.GPIO4);
-    let mut ws2812 = Ws2812::new(spi);
+    let driver = Ws2812::new(spi);
+    let mut leds = LedsAdapter::new(driver);
 
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
     let (mut rx, _) = usb_serial.split();
 
-    let mut leds = [RGB8::default(); NUM_LEDS];
-    let mut raw_bytes = [0u8; RAW_BUF_SIZE];
-
     loop {
         // Align to ['A', 'd', 'a', high, low, checksum], while checking checksum
-        let (high, low) = match sync_header(&mut rx).await {
-            Some(counts) => counts,
-            None => continue,
+        let (high, low) = match with_timeout(RX_TIMEOUT, sync_header(&mut rx)).await {
+            Ok(Some(counts)) => counts,
+            Ok(None) => continue,
+            Err(_) => {
+                let _ = leds.write_black_if_on();
+                continue;
+            }
         };
 
         let led_count = (((high as usize) << 8) | (low as usize)) + 1;
@@ -59,11 +64,14 @@ async fn main(_spawner: Spawner) -> ! {
         let bytes_to_read = count_to_read * 3;
 
         // Fill led buffer
-        if rx
-            .read_exact(&mut raw_bytes[..bytes_to_read])
-            .await
-            .is_err()
-        {
+        let raw_pixel_bytes = leds.led_buffer();
+        let payload_res = with_timeout(
+            RX_TIMEOUT,
+            rx.read_exact(&mut raw_pixel_bytes[..bytes_to_read]),
+        )
+        .await;
+        if payload_res.is_err() {
+            let _ = leds.write_black_if_on();
             continue;
         }
 
@@ -73,20 +81,65 @@ async fn main(_spawner: Spawner) -> ! {
             let mut excess = (led_count - NUM_LEDS) * 3;
             while excess > 0 {
                 let chunk = excess.min(discard.len());
-                if rx.read_exact(&mut discard[..chunk]).await.is_err() {
+                let drain_res =
+                    with_timeout(RX_TIMEOUT, rx.read_exact(&mut discard[..chunk])).await;
+                if drain_res.is_err() {
                     break;
                 }
                 excess -= chunk;
             }
         }
 
-        // Map raw RGB bytes into RGB8 structs
-        for (i, chunk) in raw_bytes[..bytes_to_read].chunks_exact(3).enumerate() {
-            leds[i] = RGB8::new(chunk[0], chunk[1], chunk[2]);
-        }
-
         // Write data to leds
-        let _ = ws2812.write(leds);
+        let _ = leds.write();
+    }
+}
+
+struct LedsAdapter<SPI> {
+    driver: Ws2812<SPI>,
+    pixels: [RGB8; NUM_LEDS],
+    is_lit: bool,
+}
+
+impl<SPI, E> LedsAdapter<SPI>
+where
+    SPI: SpiBus<u8, Error = E>,
+{
+    fn new(driver: Ws2812<SPI>) -> Self {
+        Self {
+            driver,
+            pixels: [RGB8::default(); NUM_LEDS],
+            is_lit: false,
+        }
+    }
+
+    fn write_black(&mut self) -> Result<(), E> {
+        self.pixels.fill(BLACK);
+        self.driver.write(self.pixels)?;
+        self.is_lit = false;
+
+        Ok(())
+    }
+
+    fn write_black_if_on(&mut self) -> Result<(), E> {
+        if self.is_lit {
+            self.write_black()?;
+        }
+        Ok(())
+    }
+
+    // Access to internal buffer as inline buffer of RGB u8 values
+    fn led_buffer(&mut self) -> &mut [u8] {
+        let ptr = self.pixels.as_mut_ptr() as *mut u8;
+        // SAFETY: &mut [u8] slice with three times the length has the same memory layout as &mut [RGB8], since RGB8 is repr(C)
+        unsafe { core::slice::from_raw_parts_mut(ptr, NUM_LEDS * 3) }
+    }
+
+    fn write(&mut self) -> Result<(), E> {
+        self.driver.write(self.pixels)?;
+        self.is_lit = true;
+
+        Ok(())
     }
 }
 

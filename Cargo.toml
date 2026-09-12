@@ -20,6 +20,8 @@ embassy-executor = "0.10.0"
 embedded-io-async = "0.7.0"
 smart-leds = "0.4.0"
 ws2812-spi = "0.5.1"
+embassy-time = "0.5.1"
+embedded-hal = "1.0.0"
 
 [profile.dev]
 # The default debug profile is too slow and too big for resource-constrained devices.
